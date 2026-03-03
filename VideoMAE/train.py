@@ -1,27 +1,6 @@
-"""
-VideoMAE Training Script
-========================
-Train VideoMAE for pretraining (MAE) or classification.
-
-Usage:
-    # Pretraining (single GPU)
-    python train.py --mode pretrain --data_dir path/to/videos
-    
-    # Pretraining (multi-GPU with NCCL)
-    torchrun --nproc_per_node=2 train.py --mode pretrain --data_dir path/to/videos
-    
-    # Fine-tuning for classification
-    python train.py --mode finetune --data_dir path/to/dataset --num_classes 3
-    
-    # Fine-tuning from pretrained checkpoint (multi-GPU)
-    torchrun --nproc_per_node=2 train.py --mode finetune --data_dir path/to/dataset --num_classes 3 --pretrained_path checkpoint.pt
-
-Author: VLoad Project
-Date: 2026
-"""
-
 import os
 import argparse
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -86,6 +65,29 @@ def cleanup_distributed():
 def is_main_process(rank):
     """Check if current process is the main process."""
     return rank == 0
+
+
+def setup_pretrain_logger(output_dir: Path, filename: str = "pretrain.log") -> logging.Logger:
+    """Create a logger that writes to console and a pretraining log file."""
+    # Use output directory in the logger name to keep handlers scoped per run
+    logger = logging.getLogger(f"videomae_pretrain_{output_dir}")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter("%(asctime)s - %(message)s")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(output_dir / filename)
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
+    return logger
 
 
 # =============================================================================
@@ -281,17 +283,19 @@ def pretrain(args: argparse.Namespace) -> None:
     
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     
-    if is_main_process(rank):
-        print(f"Using device: {device}")
-        print(f"Distributed training: {is_distributed}")
-        if is_distributed:
-            print(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
-            print(f"Using NCCL backend for distributed training")
-    
-    # Create output directory (only main process)
+    # Create output directory and logger (only main process)
     output_dir = Path(args.output_dir)
     if is_main_process(rank):
         output_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_pretrain_logger(output_dir) if is_main_process(rank) else None
+    log = logger.info if logger else print
+
+    if is_main_process(rank):
+        log(f"Using device: {device}")
+        log(f"Distributed training: {is_distributed}")
+        if is_distributed:
+            log(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
+            log("Using NCCL backend for distributed training")
     
     # Synchronize before continuing
     if is_distributed:
@@ -311,10 +315,10 @@ def pretrain(args: argparse.Namespace) -> None:
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main_process(rank):
-            print(f"Using DistributedDataParallel with {world_size} GPUs (NCCL backend)")
+            log(f"Using DistributedDataParallel with {world_size} GPUs (NCCL backend)")
     
     if is_main_process(rank):
-        print(f"\nModel info: {get_model_info(model.module if is_distributed else model)}")
+        log(f"Model info: {get_model_info(model.module if is_distributed else model)}")
     
     # Create dataloader with distributed sampler
     if is_distributed:
@@ -327,6 +331,7 @@ def pretrain(args: argparse.Namespace) -> None:
             num_clips=args.num_clips,
             rank=rank,
             world_size=world_size,
+            activity_filter=args.activity_filter,
         )
     else:
         dataloader = create_pretraining_dataloader(
@@ -336,6 +341,7 @@ def pretrain(args: argparse.Namespace) -> None:
             num_frames=args.num_frames,
             image_size=args.image_size,
             num_clips=args.num_clips,
+            activity_filter=args.activity_filter,
         )
     
     # Optimizer and scheduler
@@ -357,7 +363,7 @@ def pretrain(args: argparse.Namespace) -> None:
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume)
         if is_main_process(rank):
-            print(f"Resumed from epoch {start_epoch}")
+            log(f"Resumed from epoch {start_epoch}")
     
     # Training loop
     best_loss = float("inf")
@@ -377,7 +383,7 @@ def pretrain(args: argparse.Namespace) -> None:
         scheduler.step()
         
         if is_main_process(rank):
-            print(f"Epoch {epoch}: loss={loss:.4f}, lr={scheduler.get_last_lr()[0]:.6f}")
+            log(f"Epoch {epoch}: loss={loss:.4f}, lr={scheduler.get_last_lr()[0]:.6f}")
         
         # Save only the best model (only main process)
         if is_main_process(rank) and loss < best_loss:
@@ -387,11 +393,11 @@ def pretrain(args: argparse.Namespace) -> None:
                 str(output_dir / "best_model.pt"),
                 is_best=True,
             )
-            print(f"  -> New best model saved (loss={loss:.4f})")
-    
+            log(f"New best model saved (loss={loss:.4f})")
+
     if is_main_process(rank):
-        print(f"\nPretraining complete! Best loss: {best_loss:.4f}")
-        print(f"Best model saved to {output_dir / 'best_model.pt'}")
+        log(f"Pretraining complete! Best loss: {best_loss:.4f}")
+        log(f"Best model saved to {output_dir / 'best_model.pt'}")
     
     # Cleanup
     cleanup_distributed()
@@ -492,6 +498,8 @@ def finetune(args: argparse.Namespace) -> None:
         if is_distributed:
             print(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
             print(f"Using NCCL backend for distributed training")
+        if args.activity_filter:
+            print(f"Activity filter: {args.activity_filter}")
     
     # Create output directory (only main process)
     output_dir = Path(args.output_dir)
@@ -517,6 +525,7 @@ def finetune(args: argparse.Namespace) -> None:
             class_names=args.class_names.split(",") if args.class_names else None,
             num_clips=args.num_clips,
             sampling_strategy=args.sampling_strategy,
+            activity_filter=args.activity_filter,
             rank=rank,
             world_size=world_size,
         )
@@ -531,6 +540,7 @@ def finetune(args: argparse.Namespace) -> None:
             class_names=args.class_names.split(",") if args.class_names else None,
             num_clips=args.num_clips,
             sampling_strategy=args.sampling_strategy,
+            activity_filter=args.activity_filter,
         )
     
     # Create model
@@ -640,6 +650,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling_strategy", type=str, default="multi_clip",choices=["multi_clip", "uniform"],
                         help="Frame sampling strategy: 'multi_clip' (8 clips from middle 60%%) "
                              "or 'uniform' (16 frames uniformly from middle 60%%)")
+    parser.add_argument("--activity_filter", type=str, default=None, choices=["walk", "carry"],
+                        help="Only include videos from this activity subfolder (walk or carry) "
+                            "for pretraining or fine-tuning; matched against dataset path parts.")
     
     # Model
     parser.add_argument("--model_name", type=str, default="videomae-base",help="Model configuration name")
