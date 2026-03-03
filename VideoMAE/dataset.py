@@ -129,6 +129,7 @@ class BaseVideoDataset(Dataset):
         image_size: int = 224,
         num_clips: int = 8,
         augment: bool = True,
+        use_middle_60: bool = True,
         processor: Optional["VideoMAEImageProcessor"] = None,
     ):
         self.num_frames = num_frames
@@ -136,6 +137,7 @@ class BaseVideoDataset(Dataset):
         self.image_size = image_size
         self.num_clips = num_clips
         self.augment = augment
+        self.use_middle_60 = use_middle_60
         
         if processor is None and HF_AVAILABLE:
             self.processor = VideoMAEImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -259,12 +261,12 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
         val_operators: Optional[List[str]] = None,
         class_names: Optional[List[str]] = None,
         sampling_strategy: str = "multi_clip",
+        include_operators: Optional[List[str]] = None,
+        activity_filter: Optional[str] = None,
         **kwargs,
     ):
-        # Adjust num_clips based on strategy and split
+        # Adjust num_clips based on strategy
         if sampling_strategy == "uniform":
-            kwargs["num_clips"] = 1
-        elif split != "train":
             kwargs["num_clips"] = 1
         
         super().__init__(augment=kwargs.pop("augment", True) and split == "train", **kwargs)
@@ -273,6 +275,8 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
         self.split = split
         self.sampling_strategy = sampling_strategy
         self.val_operators = val_operators or ["ope7", "ope8"]
+        self.include_operators = set(include_operators) if include_operators else None
+        self.activity_filter = activity_filter
         
         self.class_names, self.samples = self._discover_samples(class_names)
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
@@ -280,7 +284,8 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
         
         operators = {op for _, _, op in self.samples}
         print(f"Classification ({split}): {len(self.samples)} videos x {self.num_clips} clips = {self.total_samples} samples")
-        print(f"  Classes: {self.class_names}, Operators: {sorted(operators)}, Strategy: {sampling_strategy}")
+        extra = f", Activity: {activity_filter}" if activity_filter else ""
+        print(f"  Classes: {self.class_names}, Operators: {sorted(operators)}, Strategy: {sampling_strategy}{extra}")
     
     def _discover_samples(self, class_names: Optional[List[str]]) -> Tuple[List[str], List[Tuple[str, int, str]]]:
         """Discover video samples split by operator."""
@@ -300,11 +305,20 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
                 if video_path.suffix.lower() not in extensions:
                     continue
                 
+                if self.activity_filter and self.activity_filter not in video_path.parts:
+                    continue
+
                 operator = next((p for p in video_path.parts if p.startswith("ope") and len(p) <= 5), "unknown")
-                is_val = operator in self.val_operators
                 
-                if (self.split == "val" and is_val) or (self.split == "train" and not is_val):
-                    samples.append((str(video_path), class_idx, operator))
+                # If include_operators is set, only keep samples from those operators
+                if self.include_operators is not None:
+                    if operator in self.include_operators:
+                        samples.append((str(video_path), class_idx, operator))
+                else:
+                    # Legacy behaviour: split by val_operators
+                    is_val = operator in self.val_operators
+                    if (self.split == "val" and is_val) or (self.split == "train" and not is_val):
+                        samples.append((str(video_path), class_idx, operator))
         
         return class_names, samples
     
@@ -316,7 +330,7 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
         video_path, label, _ = self.samples[video_idx]
         
         try:
-            video = self._load_clip(video_path, clip_idx, use_middle_60=True)
+            video = self._load_clip(video_path, clip_idx, use_middle_60=self.use_middle_60)
             
             if self.augment:
                 video = self._apply_augmentation(video, flip_only=True)
@@ -324,12 +338,14 @@ class VideoMAEClassificationDataset(BaseVideoDataset):
             return {
                 "pixel_values": self._process_video(video),
                 "labels": torch.tensor(label, dtype=torch.long),
+                "video_idx": torch.tensor(video_idx, dtype=torch.long),
             }
         except Exception as e:
             print(f"Error loading {video_path}: {e}")
             return {
                 "pixel_values": torch.zeros(3, self.num_frames, self.image_size, self.image_size),
                 "labels": torch.tensor(label, dtype=torch.long),
+                "video_idx": torch.tensor(video_idx, dtype=torch.long),
             }
 
 
@@ -346,14 +362,27 @@ def create_pretraining_dataloader(
     num_clips: int = 8,
     rank: int = 0,
     world_size: int = 1,
+    activity_filter: Optional[str] = None,
     **kwargs,
 ) -> DataLoader:
-    """Create DataLoader for pretraining (supports distributed)."""
+    """Create DataLoader for pretraining (supports distributed).
+    
+    Args:
+        activity_filter: If set, only include videos whose path contains this
+            activity subfolder (e.g. 'walk'). Matched against path parts.
+    """
     extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     video_paths = [str(p) for p in Path(video_dir).rglob("*") if p.suffix.lower() in extensions]
     
+    if activity_filter:
+        video_paths = [
+            p for p in video_paths
+            if activity_filter in Path(p).parts
+        ]
+    
     if rank == 0:
-        print(f"Found {len(video_paths)} videos for pretraining")
+        print(f"Found {len(video_paths)} videos for pretraining"
+              f"{f' (activity={activity_filter})' if activity_filter else ''}")
     
     dataset = VideoMAEPretrainingDataset(
         video_paths=video_paths,
@@ -386,6 +415,7 @@ def create_classification_dataloaders(
     class_names: Optional[List[str]] = None,
     num_clips: int = 8,
     sampling_strategy: str = "multi_clip",
+    activity_filter: Optional[str] = None,
     rank: int = 0,
     world_size: int = 1,
     **kwargs,
@@ -394,10 +424,11 @@ def create_classification_dataloaders(
     val_operators = val_operators or ["ope7", "ope8"]
     
     if rank == 0:
-        print(f"Operator-based split: val_operators={val_operators}, Strategy: {sampling_strategy}")
+        print(f"Operator-based split: val_operators={val_operators}, Strategy: {sampling_strategy}, Activity: {activity_filter}")
     
     common = dict(num_frames=num_frames, image_size=image_size, val_operators=val_operators,
-                  class_names=class_names, sampling_strategy=sampling_strategy, **kwargs)
+                  class_names=class_names, sampling_strategy=sampling_strategy,
+                  activity_filter=activity_filter, **kwargs)
     
     train_ds = VideoMAEClassificationDataset(data_dir, split="train", num_clips=num_clips, augment=True, **common)
     val_ds = VideoMAEClassificationDataset(data_dir, split="val", num_clips=1, augment=False, **common)
@@ -411,6 +442,162 @@ def create_classification_dataloaders(
                             num_workers=num_workers, pin_memory=True)
     
     return train_loader, val_loader
+
+
+# =============================================================================
+# Cross-Validation DataLoader Factory
+# =============================================================================
+
+def create_cv_fold_dataloaders(
+    data_dir: str,
+    train_operators: List[str],
+    val_operators: List[str],
+    batch_size: int = 8,
+    num_workers: int = 4,
+    num_frames: int = 16,
+    image_size: int = 224,
+    class_names: Optional[List[str]] = None,
+    num_clips: int = 1,
+    val_num_clips: int = 8,
+    sampling_strategy: str = "multi_clip",
+    activity_filter: Optional[str] = None,
+    rank: int = 0,
+    world_size: int = 1,
+    **kwargs,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train/val DataLoaders for a single cross-validation fold.
+
+    This explicitly accepts train_operators and val_operators lists,
+    making it suitable for Leave-One-Operator-Out CV where each fold
+    has a different operator held out for validation.
+
+    Args:
+        data_dir: Root directory of the dataset.
+        train_operators: List of operator IDs to use for training (e.g. ["ope1", "ope2", ...]).
+        val_operators: List of operator IDs to use for validation (e.g. ["ope3"]).
+        batch_size: Batch size per GPU.
+        num_workers: Number of data loading workers.
+        num_frames: Number of frames per clip.
+        image_size: Input spatial resolution.
+        class_names: List of class names (auto-discovered if None).
+        num_clips: Number of clips per video for training (default 1).
+        val_num_clips: Number of clips per video for validation with logit
+            averaging (default 8).
+        sampling_strategy: "multi_clip" or "uniform".
+        rank: Process rank for distributed training.
+        world_size: Total number of processes.
+
+    Returns:
+        (train_loader, val_loader) tuple.
+    """
+    if rank == 0:
+        print(f"  CV fold: train_operators={train_operators}, val_operators={val_operators}")
+
+    common = dict(
+        num_frames=num_frames,
+        image_size=image_size,
+        class_names=class_names,
+        sampling_strategy=sampling_strategy,
+        activity_filter=activity_filter,
+        **kwargs,
+    )
+
+    train_ds = VideoMAEClassificationDataset(
+        data_dir, split="train",
+        val_operators=val_operators,
+        include_operators=train_operators,  # explicitly restrict to train operators only
+        num_clips=num_clips, augment=True, **common,
+    )
+    val_ds = VideoMAEClassificationDataset(
+        data_dir, split="val",
+        val_operators=val_operators,
+        include_operators=val_operators,    # explicitly restrict to val operators only
+        num_clips=val_num_clips, augment=False, **common,
+    )
+
+    # Sanity check: verify that actual operators match what we expect
+    train_ops = {op for _, _, op in train_ds.samples}
+    val_ops = {op for _, _, op in val_ds.samples}
+    assert val_ops == set(val_operators), (
+        f"Expected val operators {set(val_operators)}, got {val_ops}"
+    )
+    assert train_ops == set(train_operators), (
+        f"Expected train operators {set(train_operators)}, got {train_ops}"
+    )
+
+    train_sampler = DistributedSampler(train_ds, world_size, rank, shuffle=True) if world_size > 1 else None
+    val_sampler = DistributedSampler(val_ds, world_size, rank, shuffle=False) if world_size > 1 else None
+
+    train_loader = DataLoader(
+        train_ds, batch_size, shuffle=(train_sampler is None),
+        sampler=train_sampler, num_workers=num_workers,
+        pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size, shuffle=False,
+        sampler=val_sampler, num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+
+def create_test_dataloader(
+    data_dir: str,
+    test_operators: List[str],
+    batch_size: int = 8,
+    num_workers: int = 4,
+    num_frames: int = 16,
+    image_size: int = 224,
+    class_names: Optional[List[str]] = None,
+    num_clips: int = 8,
+    sampling_strategy: str = "multi_clip",
+    use_middle_60: bool = True,
+    activity_filter: Optional[str] = None,
+    rank: int = 0,
+    world_size: int = 1,
+    **kwargs,
+) -> DataLoader:
+    """
+    Create a DataLoader containing ONLY the specified test operators.
+
+    Used for the final held-out test evaluation (e.g. ope8).
+
+    Args:
+        data_dir: Root directory of the dataset.
+        test_operators: List of operator IDs reserved for testing.
+        batch_size: Batch size.
+        num_workers: Number of data loading workers.
+        num_frames: Number of frames per clip.
+        image_size: Input spatial resolution.
+        class_names: List of class names (auto-discovered if None).
+        sampling_strategy: "multi_clip" or "uniform".
+        rank: Process rank for distributed training.
+        world_size: Total number of processes.
+
+    Returns:
+        test_loader DataLoader.
+    """
+    # Use val_operators = test_operators so that split="val" picks them up
+    test_ds = VideoMAEClassificationDataset(
+        data_dir, split="val",
+        val_operators=test_operators,
+        num_clips=num_clips, augment=False,
+        use_middle_60=use_middle_60,
+        num_frames=num_frames, image_size=image_size,
+        class_names=class_names, sampling_strategy=sampling_strategy,
+        activity_filter=activity_filter,
+        **kwargs,
+    )
+
+    sampler = DistributedSampler(test_ds, world_size, rank, shuffle=False) if world_size > 1 else None
+
+    return DataLoader(
+        test_ds, batch_size, shuffle=False,
+        sampler=sampler, num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 # Aliases for backward compatibility
