@@ -186,6 +186,11 @@ def generate_tube_mask(
     """
     Generate tube masking for VideoMAE pretraining.
     
+    A tube mask is generated over the spatial grid and replicated identically
+    across all temporal positions, so each masked spatial location is masked
+    at every timestep.  This forces the model to reconstruct entire
+    space-time tubes rather than interpolating from adjacent frames.
+    
     Args:
         batch_size: Batch size
         num_frames: Number of frames
@@ -199,23 +204,26 @@ def generate_tube_mask(
         Boolean mask tensor (batch_size, num_patches) where True = masked
     """
     # Calculate number of patches
-    num_patches_per_frame = (image_size // patch_size) ** 2
-    num_temporal_patches = num_frames // tubelet_size
-    num_patches = num_patches_per_frame * num_temporal_patches
+    num_patches_per_frame = (image_size // patch_size) ** 2  # 196 for 224/16
+    num_temporal_patches = num_frames // tubelet_size         # 8 for 16/2
     
-    # Number of patches to mask
-    num_masked = int(num_patches * mask_ratio)
+    # Number of spatial positions to mask (applied to every temporal position)
+    num_spatial_masked = int(num_patches_per_frame * mask_ratio)
     
     # Generate random masks for each sample in batch
     masks = []
     for _ in range(batch_size):
-        # Random permutation of patch indices
-        noise = torch.rand(num_patches)
+        # Random permutation over spatial positions only
+        noise = torch.rand(num_patches_per_frame)
         ids_shuffle = torch.argsort(noise)
         
-        # Create mask: True for masked positions
-        mask = torch.zeros(num_patches, dtype=torch.bool)
-        mask[ids_shuffle[:num_masked]] = True
+        # Create spatial mask: True for masked positions
+        spatial_mask = torch.zeros(num_patches_per_frame, dtype=torch.bool)
+        spatial_mask[ids_shuffle[:num_spatial_masked]] = True
+        
+        # Repeat the same spatial mask across all temporal positions
+        # Layout: [t0_s0, t0_s1, ..., t0_s195, t1_s0, ..., t7_s195]
+        mask = spatial_mask.unsqueeze(0).expand(num_temporal_patches, -1).reshape(-1)
         masks.append(mask)
     
     return torch.stack(masks).to(device)
